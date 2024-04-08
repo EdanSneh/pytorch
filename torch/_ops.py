@@ -702,11 +702,10 @@ class OpOverload(OperatorBase):
                     # TODO: This path is slow, should generally encourage this
                     # case to not happen
                     return self._op_dk(key, *args, **kwargs)
-                # TODO(voz): The idea behind this is that we do not yet support dispatch by key + mode, only key.
-                return self.python_key_mode_table[curr_mode](*args, **kwargs)
 
-            self._dispatch_cache[key] = handler
-            add_cached_op(self)
+                with torch.utils._python_dispatch._pop_mode_temporarily() as mode:
+                    return self.python_key_mode_table[curr_mode](mode, *args, **kwargs)
+
             return handler
 
         functionality_key = torch._C._to_functionality_key(key)  # type: ignore[attr-defined]
@@ -760,7 +759,6 @@ class OpOverload(OperatorBase):
                     add_cached_op(self)
                 return handler
 
-        # print(self, key, final_key)
         r = self.py_kernels.get(final_key, final_key)
         if cache_result:
             self._dispatch_cache[key] = r
@@ -788,11 +786,77 @@ class OpOverload(OperatorBase):
 # TorchBindOpOverload are those custom ops which have at least one overload's
 # schema consists of torch.ScriptObject (i.e. custom class) input.
 # TorchBindOpOverload will skip C++ dispatcher and purely dispatched in python
-# when its inputs contain FakeScriptObject.
+# when its inputs contain FakeScriptObject in a similar way as higher order ops.
 class TorchBindOpOverload(OpOverload):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self._is_torchbind_op = True
+
+        self.non_fallthrough_keys = torch._C._dispatch_keyset_full()
+
+        _TORCH_BIND_OP_DEFAULT_FALLTHROUGH_DISPATCH_KEYS = [
+            DispatchKey.PythonDispatcher,  # type: ignore[attr-defined]
+            DispatchKey.PythonTLSSnapshot,  # type: ignore[attr-defined]
+            DispatchKey.ADInplaceOrView,
+            DispatchKey.BackendSelect,
+        ]
+        for key in _TORCH_BIND_OP_DEFAULT_FALLTHROUGH_DISPATCH_KEYS:
+            self.non_fallthrough_keys = self.non_fallthrough_keys.remove(key)
+
+    # Note: we automaticallly add implementations for modes that useful for tracing.
+    # We only add implementation when we must dispatch in python by checking the inputs.
+    # We cannot do it before seeing the inputs ecause some torch bind ops
+    # (e.g. profiler record function) might be registered globally
+    # with a single default implementation in cpp. We might accidently trace them
+    # into graph.
+    def _maybe_py_impl_default_dispatch_mode(self):
+        def wrapper(mode, *args, **kwargs):
+            return _mannually_invoke_dispatch_mode_in_python(
+                mode, self, *args, **kwargs
+            )
+
+        for mode in (
+            torch._subclasses.functional_tensor.FunctionalTensorMode,
+            torch.fx.experimental.proxy_tensor.ProxyTorchDispatchMode,
+            torch._subclasses.fake_tensor.FakeTensorMode,
+        ):
+            if mode not in self.python_key_mode_table:
+                self.py_impl(mode)(wrapper)
+
+    # use `self_` to avoid naming collide with arguments that
+    # are named "self". This way, they can be called by kwargs.
+    def __call__(self_, *args, **kwargs):  # noqa: B902
+        # The path when any inputs are FakeScriptObject, we need to
+        # skip c++ dispatcher and dispatch in python through _get_dispatch of python_dispatcher.
+        if _must_dispatch_in_python(args, kwargs):
+            self_._maybe_py_impl_default_dispatch_mode()
+            return self_.dispatch_in_python(args, kwargs)
+
+        return self_._op(*args, **kwargs)
+
+    def dispatch_in_python(self, args, kwargs):
+        dispatch_key_set = _compute_keyset(args, kwargs, self.non_fallthrough_keys)
+        dispatch_key = dispatch_key_set.highestPriorityTypeId()
+        handler = (
+            self._get_dispatch(dispatch_key)
+            if dispatch_key not in self._dispatch_cache
+            else self._dispatch_cache[dispatch_key]
+        )
+        if isinstance(handler, DispatchKey):
+            raise RuntimeError(
+                f"Cannot handle FakeScriptObject with python dispatcher with dispatch key {handler}."
+                f"Please implement it by annotating a python callable with py_impl({handler})."
+            )
+        assert isinstance(handler, Callable)  # type: ignore[arg-type]
+        return handler(*args, **kwargs)
+
+
+def _must_dispatch_in_python(args, kwargs):
+    return pytree.tree_any(
+        lambda obj: isinstance(
+            obj, torch._library.fake_class_registry.FakeScriptObject
+        ),
+        (args, kwargs),
+    )
 
 
 def _has_script_object_arg(schema: torch.FunctionSchema) -> bool:
@@ -819,6 +883,9 @@ class OpOverloadPacket:
             overload_name: _has_script_object_arg(schema)
             for overload_name, schema in self._schemas.items()
         }
+        self._has_torchbind_op_overload = any(
+            self._overload_has_script_obj_arg.values()
+        )
 
     # it's a no-op since OpOverloadPacket object is immutable and must be unique for a given op.
     def __deepcopy__(self, memo=None):
@@ -903,11 +970,43 @@ class OpOverloadPacket:
         # is still callable from JIT
         # We save the function ptr as the `op` attribute on
         # OpOverloadPacket to access it here.
+
+        # Directly calling OverloadPacket goes into C++, which will check
+        # the schema and cause an error for torchbind op when inputs consist of FakeScriptObject so we
+        # intercept it here and call TorchBindOpverload instead.
+        if self_._has_torchbind_op_overload and _must_dispatch_in_python(args, kwargs):
+            return _call_overload_packet_from_python(self_, args, kwargs)
         return self_._op(*args, **(kwargs or {}))
 
     # TODO: use this to make a __dir__
     def overloads(self):
         return [n if n else "default" for n in self._overload_names]
+
+
+# Note - this mirrors the logic of the cpp_function defined in jit/python/init.cpp
+# _jit_get_operations, which calls _get_operation_for_overload_or_packet.
+def _call_overload_packet_from_python(op: OpOverloadPacket, args, kwargs):
+    # Re-use the torch function handling logic in cpp
+    torch_function_called, ret = torch._C._maybe_call_torch_function_for_op_packet(
+        op, *args, **kwargs
+    )  # type: ignore[attr-defined]
+
+    if torch_function_called:
+        return ret
+
+    # In cpp, we do a schema matching for the arguments, and call ToIValue to
+    # to check whether the arguments are valid. But need to do similar things here
+    # and skip the ToIValue check because FakeScriptObject won't convert to IValue.
+    exceptions = {}
+    for overload_name in op.overloads():
+        try:
+            return getattr(op, overload_name)(*args, **kwargs)
+        except RuntimeError as e:
+            exceptions[overload_name] = e
+            continue
+    raise RuntimeError(
+        f"Fail to call all TorchBindOverloads of {op} with exceptions {exceptions}"
+    )
 
 
 # Resolution of torch.fn is different from torch.ops.aten.fn
