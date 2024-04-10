@@ -134,6 +134,14 @@ class VecMask {
     return VectorizedN<T, N>(VectorizedN<T, N>::loadu(mask));
   }
 
+  void store(bool* b, int count) {
+    TORCH_CHECK(count == Vectorized<T>::size() * N, "Expect same number of elements in VecMask::store.");
+    TORCH_CHECK(count <= Vectorized<bool>::size(), "Expect the number is less or equal to Vectorized<bool>.");
+    Vectorized<bool> res = this->to<bool, 1>();
+    res.store(b, count);
+    return;
+  }
+
   template <typename U, int L, std::enable_if_t<L >= 2, int> = 0>
   inline VectorizedN<U, L> to() const {
     return VecMaskTo<U, L, T, N>::apply(*this);
