@@ -1183,6 +1183,7 @@ API Reference
 .. py:module:: torch.fx.passes.param_fetch
 .. py:module:: torch.fx.passes.pass_manager
 .. py:module:: torch.fx.passes.reinplace
+.. py:module:: torch.fx.passes.runtime_assert
 .. py:module:: torch.fx.passes.shape_prop
 .. py:module:: torch.fx.passes.split_module
 .. py:module:: torch.fx.passes.split_utils
@@ -1198,3 +1199,4 @@ API Reference
 .. py:module:: torch.fx.subgraph_rewriter
 .. py:module:: torch.fx.tensor_type
 .. py:module:: torch.fx.traceback
+.. py:module:: torch.fx.utils

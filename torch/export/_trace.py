@@ -43,6 +43,7 @@ from torch.fx.experimental.symbolic_shapes import (
     ShapeEnv,
 )
 from torch.fx.graph import _PyTreeCodeGen, _PyTreeInfo
+from torch.fx.passes.runtime_assert import insert_deferred_runtime_asserts
 from torch.utils._pytree import TreeSpec
 from torch.utils._sympy.value_ranges import ValueRangeError
 
@@ -1066,6 +1067,11 @@ def _export(
             ),
             example_inputs=(args, kwargs),
             constants=ep_non_strict.constants,
+        )
+        insert_deferred_runtime_asserts(
+            exported_program.graph_module,
+            fake_mode.shape_env,
+            "non_strict_exported_program",
         )
         return exported_program
 

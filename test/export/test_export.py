@@ -2101,7 +2101,6 @@ def forward(self, arg_0):
             )
         )
 
-    @testing.expectedFailureNonStrict  # non-strict does not add deferred runtime assertions
     @testing.expectedFailureSerDerPreDispatch  # .item call becomes aten.item in predispatch IR
     @testing.expectedFailurePreDispatchRunDecomp  # assert name is still referring to item
     def test_automatic_constrain_size(self):
@@ -2112,10 +2111,11 @@ def forward(self, arg_0):
 
         ep = export(M(), (torch.tensor(1), torch.ones(4, 5)))
 
-        with self.assertRaisesRegex(
-            RuntimeError,
-            r"_local_scalar_dense is outside of inline constraint \[0, 9223372036854775806\]",
-        ):
+        if is_non_strict_test(self._testMethodName):
+            error_msg = r"Deferred runtime assertion failed -u1 <= 0"
+        else:
+            error_msg = r"_local_scalar_dense is outside of inline constraint \[0, 9223372036854775806\]"
+        with self.assertRaisesRegex(RuntimeError, error_msg):
             _ = ep.module()(torch.tensor(-1), torch.randn(4, 5))
 
         self.assertTrue(
